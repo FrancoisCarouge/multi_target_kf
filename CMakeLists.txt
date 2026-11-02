@@ -54,8 +54,8 @@ ament_export_targets(motion_models HAS_LIBRARY_TARGET)
 
 # KF tracker library
 add_library(kf_tracker src/kf_tracker.cpp)
-ament_target_dependencies(kf_tracker Eigen3)
 target_link_libraries(kf_tracker 
+  Eigen3::Eigen
   hungarian
   motion_models
   ${cpp_typesupport_target})
@@ -67,13 +67,12 @@ target_include_directories(kf_tracker
 
 # ROS interface library
 add_library(tracker_ros src/tracker_ros.cpp)
-ament_target_dependencies(tracker_ros 
-  rclcpp 
-  Eigen3 
-  geometry_msgs
-  std_msgs
-  sensor_msgs)
 target_link_libraries(tracker_ros 
+  rclcpp::rclcpp
+  Eigen3::Eigen
+  ${geometry_msgs_TARGETS}
+  ${std_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
   kf_tracker
   ${cpp_typesupport_target})
 ament_export_targets(tracker_ros HAS_LIBRARY_TARGET)
