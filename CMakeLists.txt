@@ -18,6 +18,7 @@ find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(fcarouge_vendor REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(rclpy REQUIRED)
@@ -44,12 +45,25 @@ target_include_directories(hungarian
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
+# The filters on the Kalman library: the only sources needing C++26 and its headers
+add_library(typed_filters src/typed_filters.cpp)
+set_target_properties(typed_filters PROPERTIES CXX_STANDARD 26 POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(typed_filters
+  PUBLIC Eigen3::Eigen
+  PRIVATE "$<BUILD_LOCAL_INTERFACE:fcarouge_vendor::fcarouge_vendor>")
+target_include_directories(typed_filters
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+ament_export_targets(typed_filters HAS_LIBRARY_TARGET)
+
 # Motion models library (header-only)
 add_library(motion_models INTERFACE)
 target_include_directories(motion_models
   INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
+target_link_libraries(motion_models INTERFACE typed_filters)
 ament_export_targets(motion_models HAS_LIBRARY_TARGET)
 
 # KF tracker library
@@ -115,6 +129,15 @@ install(FILES
 )
 
 # Install libraries
+install(
+  TARGETS typed_filters
+  EXPORT typed_filters
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
+  RUNTIME DESTINATION bin
+  INCLUDES DESTINATION include
+)
+
 install(
   TARGETS kf_tracker
   EXPORT kf_tracker

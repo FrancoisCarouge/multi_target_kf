@@ -20,6 +20,7 @@
 
   <buildtool_depend>eigen3_cmake_module</buildtool_depend>
   <build_depend>eigen</build_depend>
+  <build_depend>fcarouge_vendor</build_depend>
 
   <build_depend>rosidl_default_generators</build_depend>
 

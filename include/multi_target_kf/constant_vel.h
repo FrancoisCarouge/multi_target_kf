@@ -35,6 +35,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define CONSTANT_VEL_H
 
 #include "multi_target_kf/motion_model.h"
+#include "multi_target_kf/typed_filters.h"
 #include <vector>
 
 /**
@@ -363,9 +364,9 @@ public:
         kf_state xx;
         xx.time_stamp = s.time_stamp + dt;
         
-        auto FF = F(dt);
-        xx.P = FF * s.P * FF.transpose() + Q(dt);
-        xx.x = f(s.x, dt);
+        xx.x = s.x;
+        xx.P = s.P;
+        multi_target_kf::predictConstantVelocity(xx.x, xx.P, dt, sigma_a_);
         
         if (debug_) {
             printf("[ConstVel::predictX] ||x_new - x_old|| = %f\n", (xx.x - s.x).norm());
@@ -385,17 +386,13 @@ public:
         kf_state xx;
         xx.time_stamp = z.time_stamp;
         
-        Eigen::VectorXd y = z.z - h(s.x); // innovation
-        Eigen::MatrixXd S = H() * s.P * H().transpose() + R_; // innovation covariance
-        Eigen::MatrixXd K = s.P * H().transpose() * S.inverse(); // optimal Kalman gain
-        xx.x = s.x + K * y;
-        xx.P = (Eigen::MatrixXd::Identity(NUM_STATES, NUM_STATES) - K * H()) * s.P;
+        xx.x = s.x;
+        xx.P = s.P;
+        multi_target_kf::updateConstantVelocity(xx.x, xx.P, z.z, R_);
         
         if (debug_) {
             printf("[ConstVel::updateX] Done updating state\n");
-            printf("[ConstVel::updateX] Norm of innovation y = %f\n", y.norm());
             std::cout << "[ConstVel::updateX] predicted state P: \n" << s.P << "\n";
-            std::cout << "[ConstVel::updateX] Kalman gain: \n" << K << "\n";
             std::cout << "[ConstVel::updateX] uncorrected state: \n" << s.x << "\n";
             std::cout << "[ConstVel::updateX] measurement: \n" << z.z << "\n";
             std::cout << "[ConstVel::updateX] corrected state: \n" << xx.x << "\n";
