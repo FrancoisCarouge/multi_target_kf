@@ -4,7 +4,6 @@
 TrackerROS::~TrackerROS()
 {
    /* Destructor */
-   delete kf_tracker_;
 }
 
 TrackerROS::TrackerROS() : Node("tracker_ros")
@@ -12,11 +11,14 @@ TrackerROS::TrackerROS() : Node("tracker_ros")
    // Load parameters from ROS parameter server
    loadParameters();
    
-   // Create the KF tracker with the loaded configuration
-   kf_tracker_ = new KFTracker(config_);
+   // Create the KF tracker of the configured motion model, with the loaded configuration
+   if (!makeTracker(tracker_, config_)) {
+      RCLCPP_ERROR(this->get_logger(), "Unknown motion model type %d", static_cast<int>(config_.model_type));
+      return;
+   }
    
    // Initialize the KF tracker
-   if (!kf_tracker_->initKF()) {
+   if (!std::visit([](auto& tracker) { return tracker.initKF(); }, tracker_)) {
       RCLCPP_ERROR(this->get_logger(), "Could not initialize Kalman filter");
       return;
    }
@@ -26,7 +28,7 @@ TrackerROS::TrackerROS() : Node("tracker_ros")
    
    // Define timers
    std::chrono::milliseconds duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::duration<double>(kf_tracker_->dt_pred_));
+      std::chrono::duration<double>(base().dt_pred_));
    
    kf_loop_timer_ = this->create_wall_timer(
       duration_ms, std::bind(&TrackerROS::filterLoop, this));
@@ -190,16 +192,16 @@ void TrackerROS::loadParameters()
 
 void TrackerROS::poseArrayCallback(const geometry_msgs::msg::PoseArray & msg)
 {
-   kf_tracker_->measurement_set_mtx_.lock();
-   kf_tracker_->measurement_set_.clear();
+   base().measurement_set_mtx_.lock();
+   base().measurement_set_.clear();
    // Clear detection set since we're using basic measurements
-   kf_tracker_->detection_set_.clear();
-   kf_tracker_->measurement_set_mtx_.unlock();
+   base().detection_set_.clear();
+   base().measurement_set_mtx_.unlock();
    
    // Sanity check
    if(msg.poses.empty())
    {
-      if(kf_tracker_->debug_)
+      if(base().debug_)
          RCLCPP_WARN(this->get_logger(), "[poseArrayCallback]: No measurements received.");
       return;
    }
@@ -208,14 +210,14 @@ void TrackerROS::poseArrayCallback(const geometry_msgs::msg::PoseArray & msg)
    // Use measurement time, instead of ROS now(). This is a proper way to match the actual measurement time
    double msg_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9;
    latest_measurement_time_ = std::max(latest_measurement_time_, msg_time);
-   kf_tracker_->measurement_set_mtx_.lock();
+   base().measurement_set_mtx_.lock();
    for (auto it = msg.poses.begin(); it != msg.poses.end(); it++)
    {
       sensor_measurement z;
       
       // z.time_stamp = now;
       z.time_stamp = msg_time;  // Use message timestamp
-      if(kf_tracker_->debug_)
+      if(base().debug_)
          RCLCPP_WARN(this->get_logger(), "[poseArrayCallback]: Measurement time = %f.", z.time_stamp);
       
       z.id = 0;
@@ -227,33 +229,33 @@ void TrackerROS::poseArrayCallback(const geometry_msgs::msg::PoseArray & msg)
       auto nrm = z.z.norm();
       if(nrm > 10000.0 || isnan(nrm))
       {
-         if(kf_tracker_->debug_)
+         if(base().debug_)
             RCLCPP_WARN(this->get_logger(), "[poseArrayCallback] Measurement norm is very large %f", z.z.norm());
          continue;
       }
       
-      kf_tracker_->measurement_set_.push_back(z);
+      base().measurement_set_.push_back(z);
    }
 
-   if(kf_tracker_->debug_){
-      RCLCPP_INFO(this->get_logger(), "[poseArrayCallback] Size of measurement_set_ : %lu", kf_tracker_->measurement_set_.size());
+   if(base().debug_){
+      RCLCPP_INFO(this->get_logger(), "[poseArrayCallback] Size of measurement_set_ : %lu", base().measurement_set_.size());
       RCLCPP_INFO(this->get_logger(), "[poseArrayCallback] Size of msg->poses : %lu", msg.poses.size());
    }
 
-   kf_tracker_->measurement_set_mtx_.unlock();
+   base().measurement_set_mtx_.unlock();
 }
 
 void TrackerROS::detectionsCallback(const multi_target_kf::msg::Detections & msg)
 {
-   kf_tracker_->measurement_set_mtx_.lock();
+   base().measurement_set_mtx_.lock();
    // Clear both measurement sets
-   kf_tracker_->detection_set_.clear();
-   kf_tracker_->measurement_set_.clear();
-   kf_tracker_->measurement_set_mtx_.unlock();
+   base().detection_set_.clear();
+   base().measurement_set_.clear();
+   base().measurement_set_mtx_.unlock();
    
    if(msg.detections.empty())
    {
-      if(kf_tracker_->debug_)
+      if(base().debug_)
          RCLCPP_WARN(this->get_logger(), "[detectionsCallback]: No detections received.");
       return;
    }
@@ -263,21 +265,21 @@ void TrackerROS::detectionsCallback(const multi_target_kf::msg::Detections & msg
    double msg_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9;
    latest_measurement_time_ = std::max(latest_measurement_time_, msg_time);
    
-   kf_tracker_->measurement_set_mtx_.lock();
+   base().measurement_set_mtx_.lock();
    for (const auto& detection : msg.detections) {
       enhanced_measurement det = convertFromDetectionMsg(detection);
       // det.time_stamp = now;
       det.time_stamp = msg_time;  // Use message timestamp
       
-      kf_tracker_->detection_set_.push_back(det);
+      base().detection_set_.push_back(det);
       
       // Also add to basic measurements for backward compatibility
       sensor_measurement basic_meas = convertToBasicMeasurement(det);
-      kf_tracker_->measurement_set_.push_back(basic_meas);
+      base().measurement_set_.push_back(basic_meas);
    }
-   kf_tracker_->measurement_set_mtx_.unlock();
+   base().measurement_set_mtx_.unlock();
    
-   if(kf_tracker_->debug_){
+   if(base().debug_){
       RCLCPP_INFO(this->get_logger(), "[detectionsCallback] Received %lu detections", msg.detections.size());
    }
 }
@@ -360,8 +362,11 @@ sensor_measurement TrackerROS::convertToBasicMeasurement(const enhanced_measurem
 
 void TrackerROS::publishCertainTracks(void)
 {
-   if(kf_tracker_->certain_tracks_.empty()){
-      if(kf_tracker_->debug_)
+   std::visit([&](auto& tracker) {
+   using Model = std::remove_cvref_t<decltype(tracker.model_)>;
+
+   if(tracker.certain_tracks_.empty()){
+      if(tracker.debug_)
          RCLCPP_WARN(this->get_logger(), "[publishCertainTracks] certain_tracks_ is empty. No tracks to publish");
       return;
    }
@@ -371,21 +376,25 @@ void TrackerROS::publishCertainTracks(void)
    multi_target_kf::msg::KFTrack track_msg;
    multi_target_kf::msg::KFTracks tracks_msg;
    
-   pose_array.header.stamp = rclcpp::Time(static_cast<uint64_t>(kf_tracker_->certain_tracks_[0].current_state.time_stamp * 1e9));
-   pose_array.header.frame_id = kf_tracker_->tracking_frame_;
+   pose_array.header.stamp = rclcpp::Time(static_cast<uint64_t>(tracker.certain_tracks_[0].current_state.time_stamp * 1e9));
+   pose_array.header.frame_id = tracker.tracking_frame_;
    tracks_msg.header = pose_array.header;
 
-   for (auto it = kf_tracker_->certain_tracks_.begin(); it != kf_tracker_->certain_tracks_.end(); it++)
+   for (auto it = tracker.certain_tracks_.begin(); it != tracker.certain_tracks_.end(); it++)
    {
-      pose.position.x = (*it).current_state.x[0];
-      pose.position.y = (*it).current_state.x[1];
-      pose.position.z = (*it).current_state.x[2];
+      // The state and covariance in SI units, the boundary with the messages
+      const auto x = Model::state_values((*it).current_state.filter);
+      const auto P = Model::covariance_values((*it).current_state.filter);
+      constexpr std::size_t N = Model::states;
+      pose.position.x = x[0];
+      pose.position.y = x[1];
+      pose.position.z = x[2];
       pose.orientation.w = 1.0;
 
       pose_array.poses.push_back(pose);
 
       track_msg.header.stamp = rclcpp::Time(static_cast<uint64_t>((*it).current_state.time_stamp*1e9));
-      track_msg.header.frame_id = kf_tracker_->tracking_frame_;
+      track_msg.header.frame_id = tracker.tracking_frame_;
       track_msg.id = (*it).id;
       track_msg.n = (*it).n;
       
@@ -394,32 +403,32 @@ void TrackerROS::publishCertainTracks(void)
       track_msg.confidence = (*it).confidence;
       track_msg.track_score = (*it).track_score;
 
-      track_msg.pose.pose.position.x = (*it).current_state.x[0];
-      track_msg.pose.pose.position.y = (*it).current_state.x[1];
-      track_msg.pose.pose.position.z = (*it).current_state.x[2];
+      track_msg.pose.pose.position.x = x[0];
+      track_msg.pose.pose.position.y = x[1];
+      track_msg.pose.pose.position.z = x[2];
       track_msg.pose.pose.orientation.w = 1.0;
 
       /* The following are model-dependent ! */
       if (config_.model_type == CONSTANT_VELOCITY || 
           config_.model_type == CONSTANT_ACCELERATION || 
           config_.model_type == ADAPTIVE_ACCEL_UKF) {
-         track_msg.twist.twist.linear.x = (*it).current_state.x[3];
-         track_msg.twist.twist.linear.y = (*it).current_state.x[4];
-         track_msg.twist.twist.linear.z = (*it).current_state.x[5];
+         track_msg.twist.twist.linear.x = x[3];
+         track_msg.twist.twist.linear.y = x[4];
+         track_msg.twist.twist.linear.z = x[5];
       }
       
       if ((config_.model_type == CONSTANT_ACCELERATION || 
            config_.model_type == ADAPTIVE_ACCEL_UKF) &&
-          (*it).current_state.x.size() >= 9) {
-         track_msg.accel.accel.linear.x = (*it).current_state.x[6];
-         track_msg.accel.accel.linear.y = (*it).current_state.x[7];
-         track_msg.accel.accel.linear.z = (*it).current_state.x[8];
+          x.size() >= 9) {
+         track_msg.accel.accel.linear.x = x[6];
+         track_msg.accel.accel.linear.y = x[7];
+         track_msg.accel.accel.linear.z = x[8];
       }
 
       // Fill the PoseWithCovariance covariance (first 3x3 block for position)
       for (int i = 0; i < 3; ++i) {
          for (int j = 0; j < 3; ++j) {
-            track_msg.pose.covariance[i*6 + j] = (*it).current_state.P(i, j);
+            track_msg.pose.covariance[i*6 + j] = P[i * N + j];
          }
       }
 
@@ -428,10 +437,10 @@ void TrackerROS::publishCertainTracks(void)
          config_.model_type == CONSTANT_ACCELERATION || 
          config_.model_type == ADAPTIVE_ACCEL_UKF) {
          
-         if ((*it).current_state.x.size() >= 6) {
+         if (x.size() >= 6) {
             for (int i = 3; i < 6; ++i) {
                for (int j = 3; j < 6; ++j) {
-                  track_msg.twist.covariance[(i-3)*6 + (j-3)] = (*it).current_state.P(i, j);
+                  track_msg.twist.covariance[(i-3)*6 + (j-3)] = P[i * N + j];
                }
             }
          }
@@ -440,11 +449,11 @@ void TrackerROS::publishCertainTracks(void)
       // Fill acceleration covariance if available
       if ((config_.model_type == CONSTANT_ACCELERATION || 
          config_.model_type == ADAPTIVE_ACCEL_UKF) &&
-         (*it).current_state.x.size() >= 9) {
+         x.size() >= 9) {
          
          for (int i = 6; i < 9; ++i) {
             for (int j = 6; j < 9; ++j) {
-               track_msg.accel.covariance[(i-6)*6 + (j-6)] = (*it).current_state.P(i, j);
+               track_msg.accel.covariance[(i-6)*6 + (j-6)] = P[i * N + j];
             }
          }
       }
@@ -474,8 +483,8 @@ void TrackerROS::publishCertainTracks(void)
       }
       
       // Track quality
-      auto P_p = (*it).current_state.P.block(0,0,3,3);
-      track_msg.position_uncertainty = sqrt(std::abs(P_p.determinant()));
+      track_msg.position_uncertainty = Model::position_volume((*it).current_state.filter).numerical_value_in(
+         mp_units::si::metre * mp_units::si::metre * mp_units::si::metre);
       
       track_msg.attributes = (*it).attributes;
 
@@ -484,12 +493,16 @@ void TrackerROS::publishCertainTracks(void)
 
    good_poses_pub_->publish(pose_array);
    good_tracks_pub_->publish(tracks_msg);
+   }, tracker_);
 }
 
 void TrackerROS::publishAllTracks(void)
 {
-   if(kf_tracker_->tracks_.empty()){
-      if(kf_tracker_->debug_)
+   std::visit([&](auto& tracker) {
+   using Model = std::remove_cvref_t<decltype(tracker.model_)>;
+
+   if(tracker.tracks_.empty()){
+      if(tracker.debug_)
          RCLCPP_WARN(this->get_logger(), "[publishAllTracks] tracks_ is empty. No tracks to publish");
       return;
    }
@@ -499,21 +512,25 @@ void TrackerROS::publishAllTracks(void)
    multi_target_kf::msg::KFTrack track_msg;
    multi_target_kf::msg::KFTracks tracks_msg;
    
-   pose_array.header.stamp = rclcpp::Time(static_cast<uint64_t>(kf_tracker_->tracks_[0].current_state.time_stamp*1e9));
-   pose_array.header.frame_id = kf_tracker_->tracking_frame_;
+   pose_array.header.stamp = rclcpp::Time(static_cast<uint64_t>(tracker.tracks_[0].current_state.time_stamp*1e9));
+   pose_array.header.frame_id = tracker.tracking_frame_;
    tracks_msg.header = pose_array.header;
 
-   for (auto it = kf_tracker_->tracks_.begin(); it != kf_tracker_->tracks_.end(); it++)
+   for (auto it = tracker.tracks_.begin(); it != tracker.tracks_.end(); it++)
    {
-     pose.position.x = (*it).current_state.x[0];
-     pose.position.y = (*it).current_state.x[1];
-     pose.position.z = (*it).current_state.x[2];
+      // The state and covariance in SI units, the boundary with the messages
+      const auto x = Model::state_values((*it).current_state.filter);
+      const auto P = Model::covariance_values((*it).current_state.filter);
+      constexpr std::size_t N = Model::states;
+     pose.position.x = x[0];
+     pose.position.y = x[1];
+     pose.position.z = x[2];
      pose.orientation.w = 1.0;
 
      pose_array.poses.push_back(pose);
 
      track_msg.header.stamp = rclcpp::Time(static_cast<uint64_t>((*it).current_state.time_stamp*1e9));
-     track_msg.header.frame_id = kf_tracker_->tracking_frame_;
+     track_msg.header.frame_id = tracker.tracking_frame_;
      track_msg.id = (*it).id;
      track_msg.n = (*it).n;
      
@@ -522,32 +539,32 @@ void TrackerROS::publishAllTracks(void)
      track_msg.confidence = (*it).confidence;
      track_msg.track_score = (*it).track_score;
 
-     track_msg.pose.pose.position.x = (*it).current_state.x[0];
-     track_msg.pose.pose.position.y = (*it).current_state.x[1];
-     track_msg.pose.pose.position.z = (*it).current_state.x[2];
+     track_msg.pose.pose.position.x = x[0];
+     track_msg.pose.pose.position.y = x[1];
+     track_msg.pose.pose.position.z = x[2];
      track_msg.pose.pose.orientation.w = 1.0;
 
      /* The following are model-dependent ! */
      if (config_.model_type == CONSTANT_VELOCITY || 
          config_.model_type == CONSTANT_ACCELERATION || 
          config_.model_type == ADAPTIVE_ACCEL_UKF) {
-        track_msg.twist.twist.linear.x = (*it).current_state.x[3];
-        track_msg.twist.twist.linear.y = (*it).current_state.x[4];
-        track_msg.twist.twist.linear.z = (*it).current_state.x[5];
+        track_msg.twist.twist.linear.x = x[3];
+        track_msg.twist.twist.linear.y = x[4];
+        track_msg.twist.twist.linear.z = x[5];
      }
      
      if ((config_.model_type == CONSTANT_ACCELERATION || 
           config_.model_type == ADAPTIVE_ACCEL_UKF) &&
-         (*it).current_state.x.size() >= 9) {
-        track_msg.accel.accel.linear.x = (*it).current_state.x[6];
-        track_msg.accel.accel.linear.y = (*it).current_state.x[7];
-        track_msg.accel.accel.linear.z = (*it).current_state.x[8];
+         x.size() >= 9) {
+        track_msg.accel.accel.linear.x = x[6];
+        track_msg.accel.accel.linear.y = x[7];
+        track_msg.accel.accel.linear.z = x[8];
      }
 
      // Fill the PoseWithCovariance covariance (first 3x3 block for position)
       for (int i = 0; i < 3; ++i) {
          for (int j = 0; j < 3; ++j) {
-            track_msg.pose.covariance[i*6 + j] = (*it).current_state.P(i, j);
+            track_msg.pose.covariance[i*6 + j] = P[i * N + j];
          }
       }
 
@@ -556,10 +573,10 @@ void TrackerROS::publishAllTracks(void)
          config_.model_type == CONSTANT_ACCELERATION || 
          config_.model_type == ADAPTIVE_ACCEL_UKF) {
          
-         if ((*it).current_state.x.size() >= 6) {
+         if (x.size() >= 6) {
             for (int i = 3; i < 6; ++i) {
                for (int j = 3; j < 6; ++j) {
-                  track_msg.twist.covariance[(i-3)*6 + (j-3)] = (*it).current_state.P(i, j);
+                  track_msg.twist.covariance[(i-3)*6 + (j-3)] = P[i * N + j];
                }
             }
          }
@@ -568,11 +585,11 @@ void TrackerROS::publishAllTracks(void)
       // Fill acceleration covariance if available
       if ((config_.model_type == CONSTANT_ACCELERATION || 
          config_.model_type == ADAPTIVE_ACCEL_UKF) &&
-         (*it).current_state.x.size() >= 9) {
+         x.size() >= 9) {
          
          for (int i = 6; i < 9; ++i) {
             for (int j = 6; j < 9; ++j) {
-               track_msg.accel.covariance[(i-6)*6 + (j-6)] = (*it).current_state.P(i, j);
+               track_msg.accel.covariance[(i-6)*6 + (j-6)] = P[i * N + j];
             }
          }
       }
@@ -602,8 +619,8 @@ void TrackerROS::publishAllTracks(void)
      }
      
      // Track quality
-     auto P_p = (*it).current_state.P.block(0,0,3,3);
-     track_msg.position_uncertainty = sqrt(std::abs(P_p.determinant()));
+     track_msg.position_uncertainty = Model::position_volume((*it).current_state.filter).numerical_value_in(
+        mp_units::si::metre * mp_units::si::metre * mp_units::si::metre);
      
      track_msg.attributes = (*it).attributes;
 
@@ -612,11 +629,12 @@ void TrackerROS::publishAllTracks(void)
 
   all_poses_pub_->publish(pose_array);
   all_tracks_pub_->publish(tracks_msg);
+   }, tracker_);
 }
 
 void TrackerROS::filterLoop(void)
 {
-    if(kf_tracker_->debug_)
+    if(base().debug_)
         RCLCPP_INFO(this->get_logger(), "[TrackerROS::filterLoop] inside filterLoop...");
 
     // Determine current time based on mode
@@ -626,7 +644,7 @@ void TrackerROS::filterLoop(void)
     
     // Safety check: don't propagate backwards in time
     if (latest_measurement_time_ > 0.0 && current_time < latest_measurement_time_) {
-        if(kf_tracker_->debug_) {
+        if(base().debug_) {
             RCLCPP_WARN(this->get_logger(), 
                        "[filterLoop] Current time (%f) is behind latest measurement (%f). Using measurement time.", 
                        current_time, latest_measurement_time_);
@@ -635,7 +653,7 @@ void TrackerROS::filterLoop(void)
     }
 
     // Run the filter loop with proper current time
-    kf_tracker_->filterLoop(current_time);
+    std::visit([&](auto& tracker) { tracker.filterLoop(current_time); }, tracker_);
 
     // Publish tracks
     publishAllTracks();
@@ -651,9 +669,8 @@ void TrackerROS::paramsTimerCallback()
      double sigma_a = this->get_parameter("sigma_a").as_double();
      if (sigma_a != config_.sigma_a) {
         config_.sigma_a = sigma_a;
-        kf_tracker_->sigma_a_ = sigma_a;
-        ConstantVelModel* model = static_cast<ConstantVelModel*>(kf_tracker_->kf_model_);
-        model->setSigmaA(sigma_a);
+        base().sigma_a_ = sigma_a;
+        std::get<ConstantVelocityTracker>(tracker_).model_.spectral_density(sigma_a);
      }
   }
   else if (config_.model_type == CONSTANT_ACCELERATION) {
@@ -661,14 +678,13 @@ void TrackerROS::paramsTimerCallback()
      double sigma_j = this->get_parameter("sigma_j").as_double();
      if (sigma_j != config_.sigma_j) {
         config_.sigma_j = sigma_j;
-        kf_tracker_->sigma_j_ = sigma_j;
-        ConstantAccelModel* model = static_cast<ConstantAccelModel*>(kf_tracker_->kf_model_);
-        model->setSigmaJ(sigma_j);
+        base().sigma_j_ = sigma_j;
+        std::get<ConstantAccelerationTracker>(tracker_).model_.spectral_density(sigma_j);
      }
    }
    // Update UKF model parameters if using that model
    else if (config_.model_type == ADAPTIVE_ACCEL_UKF) {
-       AdaptiveAccelUKF* model = static_cast<AdaptiveAccelUKF*>(kf_tracker_->kf_model_);
+       AdaptiveAccelUKF* model = &std::get<AdaptiveAccelerationTracker>(tracker_).model_.filter();
        
        // Check if any key parameters have changed
        double jerk_std = this->get_parameter("jerk_std").as_double();
@@ -698,7 +714,7 @@ void TrackerROS::paramsTimerCallback()
   
   if (r_diag != config_.r_diag) {
      config_.r_diag = r_diag;
-     if (!kf_tracker_->kf_model_->R(r_diag))
+     if (!std::visit([&](auto& tracker) { return tracker.model_.output_variances(r_diag); }, tracker_))
         RCLCPP_ERROR(this->get_logger(), "[paramsTimerCallback] Could not set r_diag");
   }
   
@@ -706,41 +722,46 @@ void TrackerROS::paramsTimerCallback()
   double V_max = this->get_parameter("V_max").as_double();
   if (V_max != config_.V_max) {
      config_.V_max = V_max;
-     kf_tracker_->V_max_ = V_max;
+     base().V_max_ = V_max;
   }
   
   double V_certain = this->get_parameter("V_certain").as_double();
   if (V_certain != config_.V_certain) {
      config_.V_certain = V_certain;
-     kf_tracker_->V_certain_ = V_certain;
+     base().V_certain_ = V_certain;
   }
   
   int N_meas = this->get_parameter("N_meas").as_int();
   if (N_meas > 0 && N_meas != config_.N_meas) {
      config_.N_meas = N_meas;
-     kf_tracker_->N_meas_ = N_meas;
+     base().N_meas_ = N_meas;
   }
   
   double l_threshold = this->get_parameter("l_threshold").as_double();
   if (l_threshold != config_.l_threshold) {
      config_.l_threshold = l_threshold;
-     kf_tracker_->l_threshold_ = l_threshold;
+     base().l_threshold_ = l_threshold;
   }
   bool do_update_step = this->get_parameter("do_kf_update_step").as_bool();
   if (do_update_step != config_.do_update_step) {
      config_.do_update_step = do_update_step;
-     kf_tracker_->do_update_step_ = do_update_step;
+     base().do_update_step_ = do_update_step;
   }
   
   double track_measurement_timeout = this->get_parameter("track_measurement_timeout").as_double();
   if (track_measurement_timeout != config_.track_measurement_timeout) {
      config_.track_measurement_timeout = track_measurement_timeout;
-     kf_tracker_->track_measurement_timeout_ = track_measurement_timeout;
+     base().track_measurement_timeout_ = track_measurement_timeout;
   }
   
   bool use_track_id = this->get_parameter("use_track_id").as_bool();
   if (use_track_id != config_.use_track_id) {
      config_.use_track_id = use_track_id;
-     kf_tracker_->use_track_id_ = use_track_id;
+     base().use_track_id_ = use_track_id;
   }
+}
+
+TrackerBase& TrackerROS::base()
+{
+   return std::visit([](auto& tracker) -> TrackerBase& { return tracker; }, tracker_);
 }

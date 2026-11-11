@@ -30,7 +30,7 @@ public:
 private:
     std::string target_frameid_; /**< Target frame name which will be post-fixed by the target unique number e.g. "tag", post-fixed will be like "tag1" */
     bool listen_tf_; /**< listens to TF to find transofrms of received measurements w.r.t. tracking_frame_ */
-    KFTracker *kf_tracker_;
+    Tracker tracker_;
 
     rclcpp::TimerBase::SharedPtr kf_loop_timer_;
 
@@ -75,7 +75,7 @@ TrackerROS::TrackerROS(/* args */): Node("tracker_ros")
 
 
    // Define timers
-   std::chrono::milliseconds duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::duration<double>(kf_tracker_->dt_pred_));
+   std::chrono::milliseconds duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::duration<double>(std::visit([](auto& tracker) { return tracker.dt_pred_; }, tracker_)));
    kf_loop_timer_ = this->create_wall_timer(
       duration_ms, std::bind(&TrackerROS::filterLoop, this)); // Define timer for constant loop rate
 

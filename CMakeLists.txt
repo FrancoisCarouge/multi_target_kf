@@ -19,6 +19,10 @@ find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(mp-units REQUIRED)
+find_package(fcarouge-kalman REQUIRED)
+find_package(fcarouge-typed-linear-algebra REQUIRED)
+find_package(fcarouge-sparse-linear-algebra REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(rclpy REQUIRED)
@@ -51,6 +55,14 @@ target_include_directories(motion_models
   INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
+# The typed motion models: Kalman, TypedLinearAlgebra, SparseLinearAlgebra, mp-units
+target_link_libraries(motion_models
+  INTERFACE
+    Eigen3::Eigen
+    mp-units::mp-units
+    fcarouge-kalman::kalman
+    fcarouge-typed-linear-algebra::tlinalg
+    fcarouge-sparse-linear-algebra::slinalg)
 ament_export_targets(motion_models HAS_LIBRARY_TARGET)
 
 # KF tracker library

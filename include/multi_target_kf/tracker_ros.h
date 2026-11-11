@@ -36,7 +36,7 @@ public:
     ~TrackerROS();
     
 private:
-    KFTracker *kf_tracker_;                    /**< Pointer to the KF tracker */
+    Tracker tracker_;                    /**< Pointer to the KF tracker */
     TrackerConfig config_;                     /**< Tracker configuration */
     std::string target_frameid_;               /**< Target frame name which will be post-fixed by the target unique number e.g. "tag", post-fixed will be like "tag1" */
     bool listen_tf_;                           /**< listens to TF to find transforms of received measurements w.r.t. tracking_frame_ */
@@ -60,6 +60,11 @@ private:
      * @brief Load parameters from ROS parameter server
      */
     void loadParameters();
+
+    /**
+     * @brief The configuration and measurements of the tracker, of any motion model
+     */
+    TrackerBase& base();
 
     /**
      * @brief Measurement ROS Callback. Updates measurement_set_

@@ -42,23 +42,38 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <mutex>   // std::mutex
 #include <thread>  // std::this_thread::get_id()
 #include <limits>
+#include <variant>
+#include <vector>
 
-#include "multi_target_kf/motion_model.h"
-#include "multi_target_kf/model_factory.h"
 #include "multi_target_kf/hungarian.h" // For state measurement assignment
+#include "multi_target_kf/model_factory.h"
+#include "multi_target_kf/structs.h"
 #include "multi_target_kf/tracker_config.h"
+#include "multi_target_kf/typed_models.h"
+#include "multi_target_kf/ukf_model.h"
+
+/**
+ * The estimate of a track: its time stamp and the filter of its motion model.
+ */
+template <typename Model>
+struct kf_estimate
+{
+    double time_stamp{0.0};
+    typename Model::filter_type filter;
+};
 
 /**
  * Structure to store the current stamped KF prediction and buffer of previous state
  */
+template <typename Model>
 struct kf_track
 {
     unsigned int id;                    /**< Unique track ID */
     std::string class_name;             /**< Object class (default: "unknown") */
     double confidence;                  /**< Average confidence (default: 1.0) */
     std::string frame_id;
-    kf_state current_state;
-    std::vector<kf_state> buffer;
+    kf_estimate<Model> current_state;
+    std::vector<typename Model::snapshot> buffer;
     unsigned int n;                     /**< Number of received measurements */
     double last_measurement_time;
     double track_score;                 /**< Track quality score (default: 1.0) */
@@ -89,18 +104,15 @@ struct kf_track
     }
 };
 
-//* KFTracker class
+//* TrackerBase class
 /**
- * Implements a Kalman-filter-based object tracker based on various motion models
+ * The configuration and the measurements of a tracker, independent of its motion model
  */
-class KFTracker
+class TrackerBase
 {
-private:
-   TrackerConfig config_;           /**< Configuration settings */
-   HungarianAlgorithm HungAlgo_;    /**< Hungarian algorithm object for state-measurement assignment */
-   unsigned int next_track_id_;     /**< Counter for assigning unique track IDs when use_track_id is false */
 protected:
-   MotionModel* kf_model_;          /**< Pointer to the motion model being used */
+   TrackerConfig config_;           /**< Configuration settings */
+   unsigned int next_track_id_;     /**< Counter for assigning unique track IDs when use_track_id is false */
    std::mutex measurement_set_mtx_; /**< mutex to guard measurement_set_ from interfering calls */
 public:
    // Add a friend declaration for TrackerROS
@@ -131,13 +143,63 @@ public:
    double track_measurement_timeout_;
    bool debug_;
 
-   std::vector<kf_track> tracks_;                     /**< Vector of current tracks. */
-   std::vector<kf_track> certain_tracks_;             /**< Vector of certain tracks only. */
    std::vector<sensor_measurement> measurement_set_;  /**< set of all measurements. */
    std::vector<enhanced_measurement> detection_set_;  /**< Detection measurements with extra info */
 
-   kf_state kf_state_pred_;                           /**< KF predicted state and covariance */
-   std::vector<kf_state> state_buffer_;               /**< Buffer to store last state_buffer_size_ predicted x and P */
+   /**
+    * @brief Constructor
+    * @param config Configuration settings (default: use default TrackerConfig)
+    */
+   explicit TrackerBase(const TrackerConfig& config = TrackerConfig());
+
+   /**
+    * @brief Get the current configuration
+    * @return Current configuration
+    */
+   const TrackerConfig& getConfig() const { return config_; }
+
+   /**
+    * @brief Get the model type currently in use
+    * @return ModelType enum value
+    */
+   ModelType getModelType() const { return config_.model_type; }
+
+   /**
+    * @brief Synchronize the configuration with the current values of the public fields
+    * This is useful for backward compatibility when the public fields are modified directly
+    */
+   void syncConfigFromFields();
+
+   /**
+    * @brief Update the public fields from the current configuration
+    * This is useful for backward compatibility when the configuration is modified
+    */
+   void syncFieldsFromConfig();
+
+   /**
+    * @brief Get the next available track ID
+    * @return Next unique track ID
+    */
+   unsigned int getNextTrackId();
+};
+
+//* KFTracker class
+/**
+ * Implements a Kalman-filter-based object tracker on a motion model: the typed constant velocity or constant
+ * acceleration filters, or the adaptive acceleration unscented filter
+ */
+template <typename Model>
+class KFTracker : public TrackerBase
+{
+private:
+   HungarianAlgorithm HungAlgo_;    /**< Hungarian algorithm object for state-measurement assignment */
+public:
+   using track_type = kf_track<Model>;
+   using estimate_type = kf_estimate<Model>;
+
+   Model model_;                                      /**< The motion model of every track */
+   std::vector<track_type> tracks_;                   /**< Vector of current tracks. */
+   std::vector<track_type> certain_tracks_;           /**< Vector of certain tracks only. */
 
    /**
     * @brief Initializes KF F,H,Q,R, and initial state and covariance estimates
@@ -193,7 +255,7 @@ public:
     * @param track Track to update
     * @param detection Detection measurement with additional information
     */
-   void updateTrackFromDetection(kf_track& track, const enhanced_measurement& detection);
+   void updateTrackFromDetection(track_type& track, const enhanced_measurement& detection);
 
    /**
     * @brief Extract tracks with high certainty from the current tracks.
@@ -216,62 +278,57 @@ public:
     * @brief Constructor
     * @param config Configuration settings (default: use default TrackerConfig)
     */
-   KFTracker(const TrackerConfig& config = TrackerConfig());
-   
-   /**
-    * @brief Legacy constructor that accepts only model type
-    * @param model_type Type of motion model to use
-    */
-   KFTracker(ModelType model_type);
-   
-   /**
-    * @brief Destructor
-    */
-   ~KFTracker();
+   explicit KFTracker(const TrackerConfig& config = TrackerConfig());
 
    /**
-    * @brief Get the current configuration
-    * @return Current configuration
-    */
-   const TrackerConfig& getConfig() const { return config_; }
-   
-   /**
-    * @brief Set a new configuration
+    * @brief Set a new configuration, of the same motion model
     * @param config New configuration
-    * @return true if successful, false otherwise
+    * @return true if successful, false otherwise: a different motion model needs a tracker of its type
     */
    bool setConfig(const TrackerConfig& config);
-   
+
+private:
    /**
-    * @brief Get the model type currently in use
-    * @return ModelType enum value
+    * @brief The estimate of a new track from a measurement
     */
-   ModelType getModelType() const { return config_.model_type; }
-   
-   /**
-    * @brief Set a new motion model
-    * @param model_type Type of model to use
-    * @return true if successful, false otherwise
-    */
-   bool setModel(ModelType model_type);
+   estimate_type initEstimate(const sensor_measurement& z);
 
    /**
-    * @brief Synchronize the configuration with the current values of the public fields
-    * This is useful for backward compatibility when the public fields are modified directly
+    * @brief The estimate of a track born from an unassigned measurement: its covariance is Q(dt_pred)
     */
-   void syncConfigFromFields();
+   estimate_type birthEstimate(const sensor_measurement& z);
 
    /**
-    * @brief Update the public fields from the current configuration
-    * This is useful for backward compatibility when the configuration is modified
+    * @brief Predicts an estimate over dt, its time stamp advanced for a positive dt
     */
-   void syncFieldsFromConfig();
+   void predictEstimate(estimate_type& estimate, double dt);
 
    /**
-    * @brief Get the next available track ID
-    * @return Next unique track ID
+    * @brief Corrects an estimate by a measurement, stamped at the measurement time
     */
-   unsigned int getNextTrackId();
+   void updateEstimate(estimate_type& estimate, const sensor_measurement& z);
+
+   /**
+    * @brief The position uncertainty volume of a track [m³], as a number for the configuration thresholds
+    */
+   double positionVolume(const track_type& track) const;
 };
+
+using ConstantVelocityTracker = KFTracker<multi_target_kf::typed::ConstantVelocity>;
+using ConstantAccelerationTracker = KFTracker<multi_target_kf::typed::ConstantAcceleration>;
+using AdaptiveAccelerationTracker = KFTracker<multi_target_kf::UnscentedAcceleration>;
+
+/**
+ * A tracker of the configured motion model
+ */
+using Tracker = std::variant<ConstantVelocityTracker, ConstantAccelerationTracker, AdaptiveAccelerationTracker>;
+
+/**
+ * @brief Constructs in place the tracker of the configured motion model
+ * @param tracker The tracker to replace
+ * @param config Configuration settings, of which the model type
+ * @return true if the model type is known, false otherwise
+ */
+bool makeTracker(Tracker& tracker, const TrackerConfig& config);
 
 #endif // KF_TRACKER_H
